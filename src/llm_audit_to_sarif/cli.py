@@ -64,10 +64,12 @@ def parse_findings(md):
 
 
 def location(path_cell):
-    """First path of the cell, as (uri, line). 'a.py:12; b.py' -> ('a.py', 12)."""
-    first = path_cell.split(";")[0].strip().strip("`").split()[0]
+    """First path of the cell, as (uri, line). 'a.py:12; b.py' or 'a.py:12, b.py' -> ('a.py', 12)."""
+    first = re.split(r"[;,]", path_cell)[0].strip().strip("`").split()[0]
     first = first.rstrip(".").rstrip("/")  # "backend/tests/..." -> "backend/tests"
     m = PATH_LINE.match(first)
+    if not m:
+        raise SystemExit(f"cannot read a path from the Path cell: {path_cell!r}")
     return m.group("path"), int(m.group("line") or 1)
 
 

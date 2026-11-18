@@ -55,6 +55,12 @@ def test_first_path_of_a_list():
     assert third["level"] == "note"
     assert uri_line(third) == ("a.py", 1)
     assert location("backend/tests/...") == ("backend/tests", 1)
+    assert location("`a.py:1001`, `b.py:395`") == ("a.py", 1001)
+    try:
+        location("a.py:x")
+        raise AssertionError("expected SystemExit")
+    except SystemExit as e:
+        assert "a.py:x" in str(e)
 
 
 def test_fingerprint_is_stable():
