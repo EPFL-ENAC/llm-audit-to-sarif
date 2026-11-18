@@ -1,0 +1,36 @@
+[project]
+name = "llm-audit-to-sarif"
+version = "0.1.0"
+description = "Convert an LLM security audit report (Markdown) to SARIF and upload it to GitHub code scanning."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "EPFL ENAC" }]
+keywords = ["sarif", "security", "code-scanning", "github"]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/epfl-enac/llm-audit-to-sarif"
+
+[project.scripts]
+llm-audit-to-sarif = "llm_audit_to_sarif.cli:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.5"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llm_audit_to_sarif"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
