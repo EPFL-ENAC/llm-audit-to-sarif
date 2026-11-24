@@ -3,10 +3,14 @@
 Usage:
   llm-audit-to-sarif REPORT.md             # writes REPORT.sarif, no upload
   llm-audit-to-sarif REPORT.md --upload    # also uploads to code scanning
+  llm-audit-to-sarif REPORT.md --gitlab-issues gitlab.example.com/group/project
 
 The upload uses the `gh` CLI. It sends the SARIF for the head commit of the
 report's "Reference" branch, under the category `llm-audit-<branch>`. A finding
 that is missing from a later upload in the same category closes automatically.
+
+GitLab has no code scanning on the Free tier. `--gitlab-issues` uses the `glab`
+CLI to keep one confidential issue per finding. It does not need a CI job.
 """
 
 import argparse
@@ -18,6 +22,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
+from urllib.parse import quote
 
 # Report priority -> (SARIF level, GitHub security-severity score)
 PRIORITY = {
@@ -28,6 +33,8 @@ PRIORITY = {
     "info": ("note", "0.0"),
 }
 GHSA = re.compile(r"GHSA(?:-[23456789cfghjmpqrvwx]{4}){3}")
+ISSUE_MARKER = re.compile(r"<!-- llm-audit:(.+):([0-9a-f]{64}) -->")
+FIXED = "llm-audit:fixed"
 PATH_LINE = re.compile(r"^(?P<path>[^\s:]+?)(?::(?P<line>\d+))?$")
 
 
@@ -161,6 +168,106 @@ def upload(sarif, repo, branch):
     print(f"Uploaded for {branch} @ {sha[:12]}: {out.strip()}")
 
 
+def json_pages(text):
+    """`glab api --paginate` prints one JSON document per page, back to back."""
+    pages, pos, text = [], 0, text.strip()
+    while pos < len(text):
+        page, pos = json.JSONDecoder().raw_decode(text, pos)
+        pages.append(page)
+        pos += len(text[pos:]) - len(text[pos:].lstrip())
+    return pages[0] if len(pages) == 1 else [item for page in pages for item in page]
+
+
+def glab(host, method, path, body=None):
+    cmd = ["glab", "api", "--hostname", host, "-X", method, path]
+    if method == "GET":
+        cmd.append("--paginate")
+    if body is not None:
+        cmd += ["--input", "-", "-H", "Content-Type: application/json"]
+    # stderr is not captured, so a glab error (401, 403, 404) shows in the terminal.
+    done = subprocess.run(
+        cmd, input=json.dumps(body) if body is not None else None, stdout=subprocess.PIPE, text=True
+    )
+    if done.returncode:
+        sys.exit(f"glab api {method} {path} failed with exit code {done.returncode}.")
+    return json_pages(done.stdout)
+
+
+def sync_gitlab_issues(sarif, host, project, branch, min_priority="low"):
+    """Keep one confidential issue per finding of `branch` in the GitLab project.
+
+    A new finding opens an issue. A finding that is missing from the report closes
+    its issue with the FIXED label, and reopens it if it comes back. An issue that
+    a person closed stays closed: that is the "dismiss" action.
+    """
+    ranks = list(PRIORITY)  # critical first
+    api = f"projects/{quote(project, safe='')}"
+    sha = glab(host, "GET", f"{api}/repository/commits/{quote(branch, safe='')}")["id"]
+    issues = {}
+    for issue in glab(host, "GET", f"{api}/issues?labels=llm-audit&state=all&per_page=100"):
+        m = ISSUE_MARKER.search(issue["description"] or "")
+        if m and m.group(1) == branch:  # each branch has its own set of issues
+            issues[m.group(2)] = issue
+
+    seen = set()
+    for result in sarif["runs"][0]["results"]:
+        priority, text = re.match(r"\[(.+?)\] (.*)", result["message"]["text"], re.DOTALL).groups()
+        rank = ranks.index(priority.lower()) if priority.lower() in ranks else ranks.index("medium")
+        fp = result["partialFingerprints"]["llmAudit/v1"]
+        issue = issues.get(fp)
+        # ponytail: same rule and path is one issue, as on GitHub
+        if fp in seen:
+            continue
+        seen.add(fp)
+        # The minimum only stops a new issue. A known finding keeps its issue.
+        if issue is None and rank > ranks.index(min_priority):
+            continue
+        loc = result["locations"][0]["physicalLocation"]
+        uri, line = loc["artifactLocation"]["uri"], loc["region"]["startLine"]
+        if issue is None:
+            new = glab(
+                host,
+                "POST",
+                f"{api}/issues",
+                {
+                    # Members only: a finding must not be public, even in a public project.
+                    "confidential": True,
+                    "title": f"[{priority}] {result['ruleId']}: {uri}:{line}",
+                    "labels": f"llm-audit,severity:{priority.lower()},branch:{branch}",
+                    "description": f"{text}\n\n"
+                    f"https://{host}/{project}/-/blob/{sha}/{uri}#L{line}\n\n"
+                    f"Branch `{branch}` at {sha[:12]}.\n\n<!-- llm-audit:{branch}:{fp} -->",
+                },
+            )
+            print(f"opened   #{new['iid']} {new['title']}")
+        elif issue["state"] == "closed" and FIXED in issue["labels"]:
+            glab(
+                host,
+                "PUT",
+                f"{api}/issues/{issue['iid']}",
+                {"state_event": "reopen", "remove_labels": FIXED},
+            )
+            print(f"reopened #{issue['iid']} {issue['title']}")
+        else:
+            print(f"kept     #{issue['iid']} ({issue['state']}) {issue['title']}")
+
+    for fp, issue in issues.items():
+        if fp not in seen and issue["state"] == "opened":
+            glab(
+                host,
+                "POST",
+                f"{api}/issues/{issue['iid']}/notes",
+                {"body": f"The audit of `{branch}` at {sha[:12]} does not report this finding."},
+            )
+            glab(
+                host,
+                "PUT",
+                f"{api}/issues/{issue['iid']}",
+                {"state_event": "close", "add_labels": FIXED},
+            )
+            print(f"closed   #{issue['iid']} {issue['title']}")
+
+
 def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
@@ -170,6 +277,17 @@ def main():
     p.add_argument("--upload", action="store_true", help="upload to GitHub code scanning with gh")
     p.add_argument("--repo", help="owner/name (default: from the report's Repository line)")
     p.add_argument("--branch", help="branch (default: from the report's Reference line)")
+    p.add_argument(
+        "--gitlab-issues",
+        metavar="HOST/PROJECT",
+        help="keep one confidential GitLab issue per finding, with glab",
+    )
+    p.add_argument(
+        "--min-priority",
+        choices=list(PRIORITY),
+        default="low",
+        help="lowest priority that opens a GitLab issue (default: low)",
+    )
     a = p.parse_args()
 
     md = a.report.read_text()
@@ -185,6 +303,13 @@ def main():
         if not repo or not branch:
             sys.exit("Cannot find the repository or branch. Pass --repo and --branch.")
         upload(sarif, repo, branch)
+
+    if a.gitlab_issues:
+        host, _, project = re.sub(r"^https://|\.git$|/$", "", a.gitlab_issues).partition("/")
+        branch = a.branch or meta.get("Reference")
+        if not project or not branch:
+            sys.exit("--gitlab-issues needs HOST/PROJECT, and a branch (--branch).")
+        sync_gitlab_issues(sarif, host, project, branch, a.min_priority)
 
 
 if __name__ == "__main__":

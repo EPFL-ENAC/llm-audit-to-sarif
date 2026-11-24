@@ -1,4 +1,5 @@
-from llm_audit_to_sarif.cli import location, parse_metadata, to_sarif
+from llm_audit_to_sarif import cli
+from llm_audit_to_sarif.cli import json_pages, location, parse_metadata, to_sarif
 
 REPORT = """# Automated Code & Security Audit Report
 
@@ -65,3 +66,41 @@ def test_first_path_of_a_list():
 
 def test_fingerprint_is_stable():
     assert results()[0]["partialFingerprints"] == results()[0]["partialFingerprints"]
+
+
+def test_json_pages():
+    assert json_pages("[1,2][3]\n") == [1, 2, 3]
+    assert json_pages('{"id": "abc"}') == {"id": "abc"}
+
+
+def test_gitlab_issues_sync(monkeypatch):
+    """Open what is new, keep what is known, close what is gone, skip below the minimum."""
+    high, low, info = results()
+    gone = "0" * 64
+    existing = [
+        # Below the minimum, but still in the report: not closed.
+        issue(4, "opened", f"<!-- llm-audit:main:{info['partialFingerprints']['llmAudit/v1']} -->"),
+        issue(1, "opened", f"<!-- llm-audit:main:{high['partialFingerprints']['llmAudit/v1']} -->"),
+        issue(2, "opened", f"<!-- llm-audit:main:{gone} -->"),
+        issue(3, "opened", f"<!-- llm-audit:dev:{gone} -->"),  # other branch: not touched
+    ]
+    calls = []
+
+    def fake_glab(host, method, path, body=None):
+        if method == "GET":
+            return {"id": "f" * 40} if "/commits/" in path else existing
+        calls.append((method, path.split("/", 2)[2], body))
+        return {"iid": 9, "title": body.get("title")}
+
+    monkeypatch.setattr(cli, "glab", fake_glab)
+    cli.sync_gitlab_issues(to_sarif(REPORT), "gitlab.example.com", "group/project", "main")
+
+    opened = [body for method, path, body in calls if (method, path) == ("POST", "issues")]
+    assert len(opened) == 1  # the Low row. High is known, Info is below the minimum.
+    assert opened[0]["confidential"] is True
+    assert low["partialFingerprints"]["llmAudit/v1"] in opened[0]["description"]
+    assert [path for method, path, _ in calls if method == "PUT"] == ["issues/2"]
+
+
+def issue(iid, state, description):
+    return {"iid": iid, "state": state, "description": description, "labels": [], "title": "t"}
